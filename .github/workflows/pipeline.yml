@@ -1,0 +1,92 @@
+name: Build and Push to Artifact Registry
+
+on:
+  push:
+    branches: ["main"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    environment: test
+    steps:
+      - name: "Checkout"
+        uses: "actions/checkout@v4"
+
+      - name: Creating .env file
+        run: |
+          mkdir -p .env
+          echo "ENVIRONMENT=$ENVIRONMENT" > .env/test.env
+          echo "APP_DATABASE_NAME=$APP_DATABASE_NAME" >> .env/test.env
+          echo "DATABASE_URL=$DATABASE_URL" >> .env/test.env
+          echo "SECRET_KEY=$SECRET_KEY" >> .env/test.env
+          echo "ALGORITHM=$ALGORITHM" >> .env/test.env
+          echo "DEFAULT_ADMIN_EMAIL=$DEFAULT_ADMIN_EMAIL" >> .env/test.env
+          echo "DEFAULT_ADMIN_PASSWORD=$DEFAULT_ADMIN_PASSWORD" >> .env/test.env
+        shell: bash
+        env:
+          ENVIRONMENT: ${{ secrets.ENVIRONMENT }}
+          APP_DATABASE_NAME: ${{ secrets.APP_DATABASE_NAME }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SECRET_KEY: ${{ secrets.SECRET_KEY }}
+          ALGORITHM: ${{ secrets.ALGORITHM }}
+          DEFAULT_ADMIN_EMAIL: ${{ secrets.DEFAULT_ADMIN_EMAIL }}
+          DEFAULT_ADMIN_PASSWORD: ${{ secrets.DEFAULT_ADMIN_PASSWORD }}
+
+      - name: "Run tests"
+        run: chmod +x bin/linux/test.sh && ./bin/linux/test.sh
+
+  build:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: "Checkout"
+        uses: "actions/checkout@v4"
+
+      - name: "Google Cloud Auth"
+        uses: "google-github-actions/auth@v2"
+        with:
+          credentials_json: "${{ secrets.SERVICE_ACCOUNT_KEY_GCP }}"
+
+      - name: Build Docker image
+        run: docker build -t ${{ vars.IMAGE_NAME }}:latest -f ./app/Dockerfile.prod ./app
+
+      - name: Configure Docker for pushing
+        run: gcloud auth configure-docker ${{ vars.REGION_ARTIFACTS_GCP }}-docker.pkg.dev --quiet
+
+      - name: Deploy to GCP Artifact Registry
+        run: |-
+          docker tag ${{ vars.IMAGE_NAME }}:latest ${{ vars.REGION_ARTIFACTS_GCP }}-docker.pkg.dev/${{ vars.PROJECT_ID }}/${{ vars.REPOSITORY }}/${{ vars.IMAGE_NAME }}:latest
+          docker push ${{ vars.REGION_ARTIFACTS_GCP }}-docker.pkg.dev/${{ vars.PROJECT_ID }}/${{ vars.REPOSITORY }}/${{ vars.IMAGE_NAME }}:latest
+
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    needs: build
+    steps:
+      - name: "Google Cloud Auth"
+        uses: "google-github-actions/auth@v2"
+        with:
+          credentials_json: "${{ secrets.SERVICE_ACCOUNT_KEY_GCP }}"
+
+      - name: Setup Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.PROJECT_ID }}
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy ${{ vars.PROJECT_NAME }} \
+            --image=${{ vars.REGION_ARTIFACTS_GCP }}-docker.pkg.dev/${{ vars.PROJECT_ID }}/${{ vars.REPOSITORY }}/${{ vars.IMAGE_NAME }}:latest \
+            --region=${{ vars.REGION_CLOUD_RUN_GCP }} \
+            --platform=managed \
+            --allow-unauthenticated \
+            --port 8005 \
+            --set-env-vars "environment=production" \
+            --set-env-vars "APP_DATABASE_NAME=${{ secrets.APP_DATABASE_NAME }}" \
+            --set-env-vars "DATABASE_URL=${{ secrets.DATABASE_URL }}" \
+            --set-env-vars "ALGORITHM=${{ secrets.ALGORITHM }}" \
+            --set-env-vars "SECRET_KEY=${{ secrets.SECRET_KEY }}" \
+            --set-env-vars "DEFAULT_ADMIN_EMAIL=${{ secrets.DEFAULT_ADMIN_EMAIL }}" \
+            --set-env-vars "DEFAULT_ADMIN_PASSWORD=${{ secrets.DEFAULT_ADMIN_PASSWORD }}" \
+            --set-env-vars "ERROR_WEBHOOK_URL=${{ secrets.ERROR_WEBHOOK_URL }}" \
+            --set-env-vars "LOG_DATABASE_NAME=${{ secrets.LOG_DATABASE_NAME }}"
